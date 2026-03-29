@@ -1,66 +1,135 @@
-use std::io::{self, Write};
+use std::env;
+use std::io::{self, BufRead, Write};
+use std::process::Command;
 
-use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
-    terminal::{self, ClearType},
-    ExecutableCommand,
+use anthropic_ai_sdk::client::AnthropicClient;
+use anthropic_ai_sdk::types::message::{
+    ContentBlock, CreateMessageParams, Message, MessageClient, MessageContent, MessageError,
+    RequiredMessageParams, Role, StopReason, Tool,
 };
+use serde_json::json;
 
-fn main() {
-    let mut stdout = io::stdout();
-    terminal::enable_raw_mode().expect("failed to enable raw mode");
+const DANGEROUS: &[&str] = &["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"];
 
-    stdout.execute(terminal::Clear(ClearType::All)).unwrap();
-    stdout.execute(crossterm::cursor::MoveTo(0, 0)).unwrap();
-    print_flush(&mut stdout, "\r\nhank-cli v0.1.0\r\n");
-    print_flush(&mut stdout, "Type a message and press Enter. Ctrl+C to quit.\r\n\r\n");
-    print_prompt(&mut stdout);
+fn run_bash(command: &str) -> String {
+    if DANGEROUS.iter().any(|d| command.contains(d)) {
+        return "Error: Dangerous command blocked".into();
+    }
+    match Command::new("sh").arg("-c").arg(command).output() {
+        Ok(o) => {
+            let mut out = String::from_utf8_lossy(&o.stdout).to_string();
+            out.push_str(&String::from_utf8_lossy(&o.stderr));
+            let out = out.trim().to_string();
+            if out.is_empty() { "(no output)".into() } else { out.chars().take(50000).collect() }
+        }
+        Err(e) => format!("Error: {e}"),
+    }
+}
 
-    let mut input = String::new();
+fn bash_tool() -> Tool {
+    Tool {
+        name: "bash".into(),
+        description: Some("Run a shell command.".into()),
+        input_schema: json!({
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "required": ["command"]
+        }),
+    }
+}
 
+async fn agent_loop(client: &AnthropicClient, model: &str, system: &str, history: &mut Vec<Message>) {
     loop {
-        if let Ok(Event::Key(key_event)) = event::read() {
-            match (key_event.code, key_event.modifiers) {
-                (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
-                (KeyCode::Enter, _) => {
-                    print_flush(&mut stdout, "\r\n");
-                    handle_input(&mut stdout, input.trim());
-                    input.clear();
-                    print_prompt(&mut stdout);
-                }
-                (KeyCode::Backspace, _) => {
-                    if !input.is_empty() {
-                        input.pop();
-                        print_flush(&mut stdout, "\x08 \x08");
-                    }
-                }
-                (KeyCode::Char(c), _) => {
-                    input.push(c);
-                    print_flush(&mut stdout, &c.to_string());
-                }
-                _ => {}
+        let params = CreateMessageParams::new(RequiredMessageParams {
+            model: model.to_string(),
+            messages: history.clone(),
+            max_tokens: 8000,
+        })
+        .with_system(system)
+        .with_tools(vec![bash_tool()]);
+
+        let response = match client.create_message(Some(&params)).await {
+            Ok(r) => r,
+            Err(e) => { eprintln!("API error: {e}"); return; }
+        };
+
+        // Append assistant turn
+        history.push(Message::new_blocks(Role::Assistant, response.content.clone()));
+
+        // If no tool_use, done
+        if !matches!(response.stop_reason, Some(StopReason::ToolUse)) {
+            return;
+        }
+
+        // Execute tools, collect results
+        let mut results = Vec::new();
+        for block in &response.content {
+            if let ContentBlock::ToolUse { id, input, .. } = block {
+                let cmd = input.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                println!("\x1b[33m$ {cmd}\x1b[0m");
+                let output = run_bash(cmd);
+                let preview: String = output.chars().take(200).collect();
+                println!("{preview}");
+                results.push(ContentBlock::ToolResult {
+                    tool_use_id: id.clone(),
+                    content: output,
+                });
             }
         }
-    }
-
-    terminal::disable_raw_mode().expect("failed to disable raw mode");
-    print_flush(&mut stdout, "\r\nBye!\r\n");
-}
-
-fn handle_input(stdout: &mut io::Stdout, input: &str) {
-    match input {
-        "ping" => print_flush(stdout, "pong\r\n"),
-        "pong" => print_flush(stdout, "ping\r\n"),
-        "" => {}
-        other => print_flush(stdout, &format!("unknown command: {other}\r\n")),
+        history.push(Message::new_blocks(Role::User, results));
     }
 }
 
-fn print_prompt(stdout: &mut io::Stdout) {
-    print_flush(stdout, "> ");
-}
+#[tokio::main]
+async fn main() {
+    dotenvy::dotenv().ok();
 
-fn print_flush(stdout: &mut io::Stdout, s: &str) {
-    write!(stdout, "{s}").unwrap();
-    stdout.flush().unwrap();
+    let api_key = env::var("ANTHROPIC_API_KEY")
+        .or_else(|_| env::var("ANTHROPIC_AUTH_TOKEN"))
+        .expect("ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN not set (check .env)");
+    let base_url = env::var("ANTHROPIC_BASE_URL").ok();
+    let model = env::var("MODEL_ID").unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
+    let cwd = env::current_dir().unwrap().display().to_string();
+    let system = format!("You are a coding agent at {cwd}. Use bash to solve tasks. Act, don't explain.");
+
+    let client: AnthropicClient = match base_url {
+        Some(url) => {
+            // Anthropic SDK expects base_url to end with /v1
+            let url = if url.ends_with("/v1") { url } else { format!("{url}/v1") };
+            AnthropicClient::builder(api_key, "2023-06-01")
+                .with_api_base_url(url)
+                .build::<MessageError>()
+                .expect("failed to create client")
+        }
+        None => AnthropicClient::new::<MessageError>(api_key, "2023-06-01")
+            .expect("failed to create client"),
+    };
+
+    let mut history: Vec<Message> = Vec::new();
+    let stdin = io::stdin();
+
+    loop {
+        print!("\x1b[36ms01 >> \x1b[0m");
+        io::stdout().flush().unwrap();
+
+        let mut query = String::new();
+        if stdin.lock().read_line(&mut query).unwrap() == 0 { break; }
+        let query = query.trim();
+        if query.is_empty() || query == "q" || query == "exit" { break; }
+
+        history.push(Message::new_text(Role::User, query));
+        agent_loop(&client, &model, &system, &mut history).await;
+
+        // Print final text response
+        if let Some(last) = history.last() {
+            if let MessageContent::Blocks { content } = &last.content {
+                for block in content {
+                    if let ContentBlock::Text { text } = block {
+                        println!("{text}");
+                    }
+                }
+            }
+        }
+        println!();
+    }
 }
