@@ -88,20 +88,20 @@ async fn main() {
         .or_else(|_| env::var("ANTHROPIC_AUTH_TOKEN"))
         .expect("ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN not set (check .env)");
     let base_url = env::var("ANTHROPIC_BASE_URL").ok();
+    let api_version = env::var("ANTHROPIC_API_VERSION").unwrap_or_else(|_| "2023-06-01".into());
     let model = env::var("MODEL_ID").unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
     let cwd = env::current_dir().unwrap().display().to_string();
     let system = format!("You are a coding agent at {cwd}. Use bash to solve tasks. Act, don't explain.");
 
     let client: AnthropicClient = match base_url {
         Some(url) => {
-            // Anthropic SDK expects base_url to end with /v1
             let url = if url.ends_with("/v1") { url } else { format!("{url}/v1") };
-            AnthropicClient::builder(api_key, "2023-06-01")
+            AnthropicClient::builder(api_key, &api_version)
                 .with_api_base_url(url)
                 .build::<MessageError>()
                 .expect("failed to create client")
         }
-        None => AnthropicClient::new::<MessageError>(api_key, "2023-06-01")
+        None => AnthropicClient::new::<MessageError>(api_key, &api_version)
             .expect("failed to create client"),
     };
 
