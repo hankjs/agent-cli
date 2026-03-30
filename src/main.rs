@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anthropic_ai_sdk::client::AnthropicClient;
 use anthropic_ai_sdk::types::message::{
@@ -12,6 +14,8 @@ use anthropic_ai_sdk::types::message::{
 use serde_json::json;
 
 const DANGEROUS: &[&str] = &["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"];
+const THRESHOLD: usize = 50000;
+const KEEP_RECENT: usize = 3;
 
 // -- TodoManager: structured state the LLM writes to --
 struct TodoItem {
@@ -75,6 +79,180 @@ impl TodoManager {
         lines.push(format!("\n({done}/{} completed)", self.items.len()));
         lines.join("\n")
     }
+}
+
+// -- SkillLoader: scan skills/<name>/SKILL.md with YAML frontmatter --
+struct Skill {
+    meta: HashMap<String, String>,
+    body: String,
+}
+
+struct SkillLoader {
+    skills: HashMap<String, Skill>,
+}
+
+impl SkillLoader {
+    fn new(skills_dir: &Path) -> Self {
+        let mut skills = HashMap::new();
+        if skills_dir.is_dir() {
+            if let Ok(entries) = fs::read_dir(skills_dir) {
+                let mut dirs: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+                dirs.sort_by_key(|e| e.file_name());
+                for entry in dirs {
+                    let skill_file = entry.path().join("SKILL.md");
+                    if skill_file.is_file() {
+                        if let Ok(text) = fs::read_to_string(&skill_file) {
+                            let (meta, body) = Self::parse_frontmatter(&text);
+                            let name = meta.get("name").cloned()
+                                .unwrap_or_else(|| entry.file_name().to_string_lossy().into());
+                            skills.insert(name, Skill { meta, body });
+                        }
+                    }
+                }
+            }
+        }
+        Self { skills }
+    }
+
+    fn parse_frontmatter(text: &str) -> (HashMap<String, String>, String) {
+        // Split on --- delimiters
+        if !text.starts_with("---\n") {
+            return (HashMap::new(), text.to_string());
+        }
+        let rest = &text[4..]; // skip first "---\n"
+        if let Some(end) = rest.find("\n---\n") {
+            let yaml_block = &rest[..end];
+            let body = rest[end + 5..].trim().to_string();
+            let mut meta = HashMap::new();
+            for line in yaml_block.lines() {
+                if let Some((key, val)) = line.split_once(':') {
+                    meta.insert(key.trim().to_string(), val.trim().to_string());
+                }
+            }
+            (meta, body)
+        } else {
+            (HashMap::new(), text.to_string())
+        }
+    }
+
+    fn get_descriptions(&self) -> String {
+        if self.skills.is_empty() {
+            return "(no skills available)".into();
+        }
+        let mut names: Vec<&String> = self.skills.keys().collect();
+        names.sort();
+        names.iter().map(|name| {
+            let skill = &self.skills[*name];
+            let desc = skill.meta.get("description").map(|s| s.as_str()).unwrap_or("No description");
+            let tags = skill.meta.get("tags").map(|s| s.as_str()).unwrap_or("");
+            if tags.is_empty() {
+                format!("  - {name}: {desc}")
+            } else {
+                format!("  - {name}: {desc} [{tags}]")
+            }
+        }).collect::<Vec<_>>().join("\n")
+    }
+
+    fn get_content(&self, name: &str) -> String {
+        match self.skills.get(name) {
+            Some(skill) => format!("<skill name=\"{name}\">\n{}\n</skill>", skill.body),
+            None => {
+                let mut available: Vec<&String> = self.skills.keys().collect();
+                available.sort();
+                format!("Error: Unknown skill '{name}'. Available: {}", available.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "))
+            }
+        }
+    }
+}
+
+// -- Context compression: three-layer pipeline --
+fn estimate_tokens(history: &[Message]) -> usize {
+    serde_json::to_string(history).map(|s| s.len() / 4).unwrap_or(0)
+}
+
+fn micro_compact(history: &mut Vec<Message>) {
+    // Build tool_use_id → tool_name map from assistant messages
+    let mut tool_name_map: HashMap<String, String> = HashMap::new();
+    for msg in history.iter() {
+        if let MessageContent::Blocks { content } = &msg.content {
+            if matches!(msg.role, Role::Assistant) {
+                for block in content {
+                    if let ContentBlock::ToolUse { id, name, .. } = block {
+                        tool_name_map.insert(id.clone(), name.clone());
+                    }
+                }
+            }
+        }
+    }
+    // Collect positions of all ToolResult blocks
+    let mut positions: Vec<(usize, usize)> = Vec::new(); // (msg_idx, block_idx)
+    for (msg_idx, msg) in history.iter().enumerate() {
+        if let MessageContent::Blocks { content } = &msg.content {
+            if matches!(msg.role, Role::User) {
+                for (block_idx, block) in content.iter().enumerate() {
+                    if let ContentBlock::ToolResult { .. } = block {
+                        positions.push((msg_idx, block_idx));
+                    }
+                }
+            }
+        }
+    }
+    if positions.len() <= KEEP_RECENT {
+        return;
+    }
+    let to_clear = &positions[..positions.len() - KEEP_RECENT];
+    for &(msg_idx, block_idx) in to_clear {
+        if let MessageContent::Blocks { content } = &mut history[msg_idx].content {
+            if let ContentBlock::ToolResult { tool_use_id, content: c } = &mut content[block_idx] {
+                if c.len() > 100 {
+                    let name = tool_name_map.get(tool_use_id.as_str()).map(|s| s.as_str()).unwrap_or("unknown");
+                    *c = format!("[Previous: used {name}]");
+                }
+            }
+        }
+    }
+}
+
+async fn auto_compact(client: &AnthropicClient, model: &str, workdir: &Path, history: &[Message]) -> Vec<Message> {
+    // Save transcript
+    let transcript_dir = workdir.join(".transcripts");
+    let _ = fs::create_dir_all(&transcript_dir);
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let transcript_path = transcript_dir.join(format!("transcript_{timestamp}.jsonl"));
+    if let Ok(mut file) = fs::File::create(&transcript_path) {
+        for msg in history {
+            if let Ok(line) = serde_json::to_string(msg) {
+                let _ = io::Write::write_all(&mut file, line.as_bytes());
+                let _ = io::Write::write_all(&mut file, b"\n");
+            }
+        }
+    }
+    println!("[transcript saved: {}]", transcript_path.display());
+
+    // Ask LLM to summarize
+    let conversation_text: String = serde_json::to_string(history).unwrap_or_default().chars().take(80000).collect();
+    let summary_prompt = format!(
+        "Summarize this conversation for continuity. Include: \
+        1) What was accomplished, 2) Current state, 3) Key decisions made. \
+        Be concise but preserve critical details.\n\n{conversation_text}"
+    );
+    let summary = match client.create_message(Some(&CreateMessageParams::new(RequiredMessageParams {
+        model: model.to_string(),
+        messages: vec![Message::new_text(Role::User, &summary_prompt)],
+        max_tokens: 2000,
+    }))).await {
+        Ok(resp) => {
+            resp.content.iter().find_map(|b| {
+                if let ContentBlock::Text { text } = b { Some(text.clone()) } else { None }
+            }).unwrap_or_else(|| "(summary failed)".into())
+        }
+        Err(e) => format!("(summary error: {e})"),
+    };
+
+    vec![
+        Message::new_text(Role::User, &format!("[Conversation compressed. Transcript: {}]\n\n{summary}", transcript_path.display())),
+        Message::new_text(Role::Assistant, "Understood. I have the context from the summary. Continuing."),
+    ]
 }
 
 fn safe_path(workdir: &Path, p: &str) -> Result<PathBuf, String> {
@@ -292,16 +470,51 @@ fn todo_tool() -> Tool {
     }
 }
 
-async fn agent_loop(client: &AnthropicClient, model: &str, system: &str, subagent_system: &str, workdir: &Path, history: &mut Vec<Message>, todo: &mut TodoManager) {
+fn load_skill_tool() -> Tool {
+    Tool {
+        name: "load_skill".into(),
+        description: Some("Load specialized knowledge by name.".into()),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Skill name to load" }
+            },
+            "required": ["name"]
+        }),
+    }
+}
+
+fn compact_tool() -> Tool {
+    Tool {
+        name: "compact".into(),
+        description: Some("Trigger manual conversation compression.".into()),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "focus": { "type": "string", "description": "What to preserve in the summary" }
+            }
+        }),
+    }
+}
+
+async fn agent_loop(client: &AnthropicClient, model: &str, system: &str, subagent_system: &str, workdir: &Path, history: &mut Vec<Message>, todo: &mut TodoManager, skill_loader: &SkillLoader) {
     let mut rounds_since_todo: u32 = 0;
     loop {
+        // Layer 1: micro_compact before each LLM call
+        micro_compact(history);
+        // Layer 2: auto_compact if token estimate exceeds threshold
+        if estimate_tokens(history) > THRESHOLD {
+            println!("[auto_compact triggered]");
+            *history = auto_compact(client, model, workdir, history).await;
+        }
+
         let params = CreateMessageParams::new(RequiredMessageParams {
             model: model.to_string(),
             messages: history.clone(),
             max_tokens: 8000,
         })
         .with_system(system)
-        .with_tools(vec![bash_tool(), read_file_tool(), write_file_tool(), edit_file_tool(), todo_tool(), task_tool()]);
+        .with_tools(vec![bash_tool(), read_file_tool(), write_file_tool(), edit_file_tool(), todo_tool(), task_tool(), load_skill_tool(), compact_tool()]);
 
         let response = match client.create_message(Some(&params)).await {
             Ok(r) => r,
@@ -319,6 +532,7 @@ async fn agent_loop(client: &AnthropicClient, model: &str, system: &str, subagen
         // Execute tools, collect results
         let mut results = Vec::new();
         let mut used_todo = false;
+        let mut manual_compact = false;
         for block in &response.content {
             if let ContentBlock::ToolUse { id, name, input } = block {
                 let output = match name.as_str() {
@@ -364,6 +578,16 @@ async fn agent_loop(client: &AnthropicClient, model: &str, system: &str, subagen
                         println!("\x1b[33m> task ({desc}): {}\x1b[0m", &prompt.chars().take(80).collect::<String>());
                         run_subagent(client, model, subagent_system, workdir, prompt).await
                     }
+                    "load_skill" => {
+                        let name = input.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        println!("\x1b[33m> load_skill: {name}\x1b[0m");
+                        skill_loader.get_content(name)
+                    }
+                    "compact" => {
+                        manual_compact = true;
+                        println!("\x1b[33m> compact\x1b[0m");
+                        "Compressing...".into()
+                    }
                     other => format!("Unknown tool: {other}"),
                 };
                 let preview: String = output.chars().take(200).collect();
@@ -382,6 +606,11 @@ async fn agent_loop(client: &AnthropicClient, model: &str, system: &str, subagen
             });
         }
         history.push(Message::new_blocks(Role::User, results));
+        // Layer 3: manual compact triggered by the compact tool
+        if manual_compact {
+            println!("[manual compact]");
+            *history = auto_compact(client, model, workdir, history).await;
+        }
     }
 }
 
@@ -467,7 +696,8 @@ async fn main() {
     let api_version = env::var("ANTHROPIC_API_VERSION").unwrap_or_else(|_| "2023-06-01".into());
     let model = env::var("MODEL_ID").unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
     let cwd = env::current_dir().unwrap().display().to_string();
-    let system = format!("You are a coding agent at {cwd}.\nUse the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.\nUse the task tool to delegate exploration or subtasks to a subagent.\nAll file paths must be relative to the working directory. Do not use absolute paths.\nPrefer tools over prose.");
+    let skill_loader = SkillLoader::new(&env::current_dir().unwrap().join("skills"));
+    let system = format!("You are a coding agent at {cwd}.\nUse the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.\nUse the task tool to delegate exploration or subtasks to a subagent.\nUse load_skill to access specialized knowledge before tackling unfamiliar topics.\nAll file paths must be relative to the working directory. Do not use absolute paths.\nPrefer tools over prose.\n\nSkills available:\n{}", skill_loader.get_descriptions());
     let subagent_system = format!("You are a coding subagent at {cwd}. Complete the given task, then summarize your findings.");
     let workdir = env::current_dir().unwrap();
 
@@ -488,7 +718,7 @@ async fn main() {
     let stdin = io::stdin();
 
     loop {
-        print!("\x1b[36ms03 >> \x1b[0m");
+        print!("\x1b[36ms06 >> \x1b[0m");
         io::stdout().flush().unwrap();
 
         let mut query = String::new();
@@ -497,7 +727,7 @@ async fn main() {
         if query.is_empty() || query == "q" || query == "exit" { break; }
 
         history.push(Message::new_text(Role::User, query));
-        agent_loop(&client, &model, &system, &subagent_system, &workdir, &mut history, &mut todo).await;
+        agent_loop(&client, &model, &system, &subagent_system, &workdir, &mut history, &mut todo, &skill_loader).await;
 
         // Print final text response
         if let Some(last) = history.last() {
