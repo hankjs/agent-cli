@@ -248,6 +248,25 @@ fn edit_file_tool() -> Tool {
     }
 }
 
+fn child_tools() -> Vec<Tool> {
+    vec![bash_tool(), read_file_tool(), write_file_tool(), edit_file_tool()]
+}
+
+fn task_tool() -> Tool {
+    Tool {
+        name: "task".into(),
+        description: Some("Spawn a subagent with fresh context. It shares the filesystem but not conversation history.".into()),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "prompt": { "type": "string" },
+                "description": { "type": "string", "description": "Short description of the task" }
+            },
+            "required": ["prompt"]
+        }),
+    }
+}
+
 fn todo_tool() -> Tool {
     Tool {
         name: "todo".into(),
@@ -273,7 +292,7 @@ fn todo_tool() -> Tool {
     }
 }
 
-async fn agent_loop(client: &AnthropicClient, model: &str, system: &str, workdir: &Path, history: &mut Vec<Message>, todo: &mut TodoManager) {
+async fn agent_loop(client: &AnthropicClient, model: &str, system: &str, subagent_system: &str, workdir: &Path, history: &mut Vec<Message>, todo: &mut TodoManager) {
     let mut rounds_since_todo: u32 = 0;
     loop {
         let params = CreateMessageParams::new(RequiredMessageParams {
@@ -282,7 +301,7 @@ async fn agent_loop(client: &AnthropicClient, model: &str, system: &str, workdir
             max_tokens: 8000,
         })
         .with_system(system)
-        .with_tools(vec![bash_tool(), read_file_tool(), write_file_tool(), edit_file_tool(), todo_tool()]);
+        .with_tools(vec![bash_tool(), read_file_tool(), write_file_tool(), edit_file_tool(), todo_tool(), task_tool()]);
 
         let response = match client.create_message(Some(&params)).await {
             Ok(r) => r,
@@ -339,6 +358,12 @@ async fn agent_loop(client: &AnthropicClient, model: &str, system: &str, workdir
                             None => "Error: items required".into(),
                         }
                     }
+                    "task" => {
+                        let prompt = input.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+                        let desc = input.get("description").and_then(|v| v.as_str()).unwrap_or("subtask");
+                        println!("\x1b[33m> task ({desc}): {}\x1b[0m", &prompt.chars().take(80).collect::<String>());
+                        run_subagent(client, model, subagent_system, workdir, prompt).await
+                    }
                     other => format!("Unknown tool: {other}"),
                 };
                 let preview: String = output.chars().take(200).collect();
@@ -360,6 +385,77 @@ async fn agent_loop(client: &AnthropicClient, model: &str, system: &str, workdir
     }
 }
 
+async fn run_subagent(client: &AnthropicClient, model: &str, subagent_system: &str, workdir: &Path, prompt: &str) -> String {
+    let mut messages = vec![Message::new_text(Role::User, prompt)];
+    for _ in 0..30 {
+        let params = CreateMessageParams::new(RequiredMessageParams {
+            model: model.to_string(),
+            messages: messages.clone(),
+            max_tokens: 8000,
+        })
+        .with_system(subagent_system)
+        .with_tools(child_tools());
+
+        let response = match client.create_message(Some(&params)).await {
+            Ok(r) => r,
+            Err(e) => return format!("Subagent API error: {e}"),
+        };
+        messages.push(Message::new_blocks(Role::Assistant, response.content.clone()));
+        if !matches!(response.stop_reason, Some(StopReason::ToolUse)) {
+            break;
+        }
+        let mut results = Vec::new();
+        for block in &response.content {
+            if let ContentBlock::ToolUse { id, name, input } = block {
+                let output = match name.as_str() {
+                    "bash" => {
+                        let cmd = input.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                        println!("\x1b[35m  sub$ {cmd}\x1b[0m");
+                        run_bash(cmd)
+                    }
+                    "read_file" => {
+                        let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                        let limit = input.get("limit").and_then(|v| v.as_i64());
+                        println!("\x1b[35m  sub> read_file: {path}\x1b[0m");
+                        run_read(workdir, path, limit)
+                    }
+                    "write_file" => {
+                        let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                        let content = input.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                        println!("\x1b[35m  sub> write_file: {path}\x1b[0m");
+                        run_write(workdir, path, content)
+                    }
+                    "edit_file" => {
+                        let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                        let old_text = input.get("old_text").and_then(|v| v.as_str()).unwrap_or("");
+                        let new_text = input.get("new_text").and_then(|v| v.as_str()).unwrap_or("");
+                        println!("\x1b[35m  sub> edit_file: {path}\x1b[0m");
+                        run_edit(workdir, path, old_text, new_text)
+                    }
+                    other => format!("Unknown tool: {other}"),
+                };
+                results.push(ContentBlock::ToolResult {
+                    tool_use_id: id.clone(),
+                    content: output.chars().take(50000).collect(),
+                });
+            }
+        }
+        messages.push(Message::new_blocks(Role::User, results));
+    }
+    // Extract final text from last assistant message
+    if let Some(last) = messages.iter().rev().find(|m| matches!(m.content, MessageContent::Blocks { .. })) {
+        if let MessageContent::Blocks { content } = &last.content {
+            let text: String = content.iter().filter_map(|b| {
+                if let ContentBlock::Text { text } = b { Some(text.as_str()) } else { None }
+            }).collect();
+            if !text.is_empty() {
+                return text;
+            }
+        }
+    }
+    "(no summary)".into()
+}
+
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
@@ -371,7 +467,8 @@ async fn main() {
     let api_version = env::var("ANTHROPIC_API_VERSION").unwrap_or_else(|_| "2023-06-01".into());
     let model = env::var("MODEL_ID").unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
     let cwd = env::current_dir().unwrap().display().to_string();
-    let system = format!("You are a coding agent at {cwd}.\nUse the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.\nAll file paths must be relative to the working directory. Do not use absolute paths.\nPrefer tools over prose.");
+    let system = format!("You are a coding agent at {cwd}.\nUse the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.\nUse the task tool to delegate exploration or subtasks to a subagent.\nAll file paths must be relative to the working directory. Do not use absolute paths.\nPrefer tools over prose.");
+    let subagent_system = format!("You are a coding subagent at {cwd}. Complete the given task, then summarize your findings.");
     let workdir = env::current_dir().unwrap();
 
     let client: AnthropicClient = match base_url {
@@ -400,7 +497,7 @@ async fn main() {
         if query.is_empty() || query == "q" || query == "exit" { break; }
 
         history.push(Message::new_text(Role::User, query));
-        agent_loop(&client, &model, &system, &workdir, &mut history, &mut todo).await;
+        agent_loop(&client, &model, &system, &subagent_system, &workdir, &mut history, &mut todo).await;
 
         // Print final text response
         if let Some(last) = history.last() {
