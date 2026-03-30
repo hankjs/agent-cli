@@ -13,7 +13,77 @@ use serde_json::json;
 
 const DANGEROUS: &[&str] = &["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"];
 
+// -- TodoManager: structured state the LLM writes to --
+struct TodoItem {
+    id: String,
+    text: String,
+    status: String, // "pending" | "in_progress" | "completed"
+}
+
+struct TodoManager {
+    items: Vec<TodoItem>,
+}
+
+impl TodoManager {
+    fn new() -> Self {
+        Self { items: Vec::new() }
+    }
+
+    fn update(&mut self, items: &[serde_json::Value]) -> Result<String, String> {
+        if items.len() > 20 {
+            return Err("Max 20 todos allowed".into());
+        }
+        let mut validated = Vec::new();
+        let mut in_progress_count = 0;
+        for (i, item) in items.iter().enumerate() {
+            let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("pending").to_lowercase();
+            let id = item.get("id").and_then(|v| v.as_str()).map(|s| s.to_string())
+                .unwrap_or_else(|| (i + 1).to_string());
+            if text.is_empty() {
+                return Err(format!("Item {id}: text required"));
+            }
+            if !["pending", "in_progress", "completed"].contains(&status.as_str()) {
+                return Err(format!("Item {id}: invalid status '{status}'"));
+            }
+            if status == "in_progress" {
+                in_progress_count += 1;
+            }
+            validated.push(TodoItem { id, text, status });
+        }
+        if in_progress_count > 1 {
+            return Err("Only one task can be in_progress at a time".into());
+        }
+        self.items = validated;
+        Ok(self.render())
+    }
+
+    fn render(&self) -> String {
+        if self.items.is_empty() {
+            return "No todos.".into();
+        }
+        let mut lines: Vec<String> = self.items.iter().map(|item| {
+            let marker = match item.status.as_str() {
+                "pending" => "[ ]",
+                "in_progress" => "[>]",
+                "completed" => "[x]",
+                _ => "[ ]",
+            };
+            format!("{marker} #{}: {}", item.id, item.text)
+        }).collect();
+        let done = self.items.iter().filter(|t| t.status == "completed").count();
+        lines.push(format!("\n({done}/{} completed)", self.items.len()));
+        lines.join("\n")
+    }
+}
+
 fn safe_path(workdir: &Path, p: &str) -> Result<PathBuf, String> {
+    // If the model passes an absolute path, strip the workdir prefix to make it relative
+    let p = if let Some(stripped) = p.strip_prefix(&format!("{}/", workdir.display())) {
+        stripped
+    } else {
+        p
+    };
     let joined = workdir.join(p);
     // For existing files, canonicalize directly
     if joined.exists() {
@@ -135,7 +205,7 @@ fn bash_tool() -> Tool {
 fn read_file_tool() -> Tool {
     Tool {
         name: "read_file".into(),
-        description: Some("Read file contents.".into()),
+        description: Some("Read file contents. Use relative paths.".into()),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -150,7 +220,7 @@ fn read_file_tool() -> Tool {
 fn write_file_tool() -> Tool {
     Tool {
         name: "write_file".into(),
-        description: Some("Write content to file.".into()),
+        description: Some("Write content to file. Use relative paths.".into()),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -165,7 +235,7 @@ fn write_file_tool() -> Tool {
 fn edit_file_tool() -> Tool {
     Tool {
         name: "edit_file".into(),
-        description: Some("Replace exact text in file.".into()),
+        description: Some("Replace exact text in file. Use relative paths.".into()),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -178,7 +248,33 @@ fn edit_file_tool() -> Tool {
     }
 }
 
-async fn agent_loop(client: &AnthropicClient, model: &str, system: &str, workdir: &Path, history: &mut Vec<Message>) {
+fn todo_tool() -> Tool {
+    Tool {
+        name: "todo".into(),
+        description: Some("Update task list. Track progress on multi-step tasks.".into()),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string" },
+                            "text": { "type": "string" },
+                            "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] }
+                        },
+                        "required": ["id", "text", "status"]
+                    }
+                }
+            },
+            "required": ["items"]
+        }),
+    }
+}
+
+async fn agent_loop(client: &AnthropicClient, model: &str, system: &str, workdir: &Path, history: &mut Vec<Message>, todo: &mut TodoManager) {
+    let mut rounds_since_todo: u32 = 0;
     loop {
         let params = CreateMessageParams::new(RequiredMessageParams {
             model: model.to_string(),
@@ -186,7 +282,7 @@ async fn agent_loop(client: &AnthropicClient, model: &str, system: &str, workdir
             max_tokens: 8000,
         })
         .with_system(system)
-        .with_tools(vec![bash_tool(), read_file_tool(), write_file_tool(), edit_file_tool()]);
+        .with_tools(vec![bash_tool(), read_file_tool(), write_file_tool(), edit_file_tool(), todo_tool()]);
 
         let response = match client.create_message(Some(&params)).await {
             Ok(r) => r,
@@ -203,6 +299,7 @@ async fn agent_loop(client: &AnthropicClient, model: &str, system: &str, workdir
 
         // Execute tools, collect results
         let mut results = Vec::new();
+        let mut used_todo = false;
         for block in &response.content {
             if let ContentBlock::ToolUse { id, name, input } = block {
                 let output = match name.as_str() {
@@ -230,6 +327,18 @@ async fn agent_loop(client: &AnthropicClient, model: &str, system: &str, workdir
                         println!("\x1b[33m> edit_file: {path}\x1b[0m");
                         run_edit(workdir, path, old_text, new_text)
                     }
+                    "todo" => {
+                        used_todo = true;
+                        let items = input.get("items").and_then(|v| v.as_array());
+                        println!("\x1b[33m> todo\x1b[0m");
+                        match items {
+                            Some(arr) => match todo.update(arr) {
+                                Ok(rendered) => rendered,
+                                Err(e) => format!("Error: {e}"),
+                            },
+                            None => "Error: items required".into(),
+                        }
+                    }
                     other => format!("Unknown tool: {other}"),
                 };
                 let preview: String = output.chars().take(200).collect();
@@ -239,6 +348,13 @@ async fn agent_loop(client: &AnthropicClient, model: &str, system: &str, workdir
                     content: output,
                 });
             }
+        }
+        rounds_since_todo = if used_todo { 0 } else { rounds_since_todo + 1 };
+        // Nag reminder: nudge the model to update todos if it hasn't recently
+        if rounds_since_todo >= 3 {
+            results.insert(0, ContentBlock::Text {
+                text: "<reminder>Update your todos.</reminder>".into(),
+            });
         }
         history.push(Message::new_blocks(Role::User, results));
     }
@@ -255,7 +371,7 @@ async fn main() {
     let api_version = env::var("ANTHROPIC_API_VERSION").unwrap_or_else(|_| "2023-06-01".into());
     let model = env::var("MODEL_ID").unwrap_or_else(|_| "claude-sonnet-4-20250514".into());
     let cwd = env::current_dir().unwrap().display().to_string();
-    let system = format!("You are a coding agent at {cwd}. Use tools to solve tasks. Act, don't explain.");
+    let system = format!("You are a coding agent at {cwd}.\nUse the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.\nAll file paths must be relative to the working directory. Do not use absolute paths.\nPrefer tools over prose.");
     let workdir = env::current_dir().unwrap();
 
     let client: AnthropicClient = match base_url {
@@ -271,10 +387,11 @@ async fn main() {
     };
 
     let mut history: Vec<Message> = Vec::new();
+    let mut todo = TodoManager::new();
     let stdin = io::stdin();
 
     loop {
-        print!("\x1b[36ms02 >> \x1b[0m");
+        print!("\x1b[36ms03 >> \x1b[0m");
         io::stdout().flush().unwrap();
 
         let mut query = String::new();
@@ -283,7 +400,7 @@ async fn main() {
         if query.is_empty() || query == "q" || query == "exit" { break; }
 
         history.push(Message::new_text(Role::User, query));
-        agent_loop(&client, &model, &system, &workdir, &mut history).await;
+        agent_loop(&client, &model, &system, &workdir, &mut history, &mut todo).await;
 
         // Print final text response
         if let Some(last) = history.last() {
