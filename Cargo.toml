@@ -8,3 +8,4 @@ anthropic-ai-sdk = "0.2"
 serde_json = "1"
 dotenvy = "0.15"
 tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
