@@ -1,0 +1,11 @@
+[package]
+name = "hank-mcp"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hank-core = { path = "../hank-core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }

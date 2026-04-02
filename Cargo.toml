@@ -1,11 +1,31 @@
-[package]
-name = "hank-cli"
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
-anthropic-ai-sdk = "0.2"
-serde_json = "1"
-dotenvy = "0.15"
+[workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
-uuid = { version = "1", features = ["v4"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+thiserror = "2"
+
+[package]
+name = "hank-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hank-core = { path = "crates/hank-core" }
+hank-tools = { path = "crates/hank-tools" }
+hank-mcp = { path = "crates/hank-mcp" }
+hank-tui = { path = "crates/hank-tui" }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures = "0.3"
+ratatui = "0.29"
+dotenvy = "0.15"
