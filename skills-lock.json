@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "sigma": {
+      "source": "sanyuan0704/sanyuan-skills",
+      "sourceType": "github",
+      "computedHash": "88bcbdec596ed7e19a50ca80282c3b12cfdcf48ae28e3ba275da3193f8a8f057"
+    }
+  }
+}
