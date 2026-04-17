@@ -104,13 +104,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     app.handle_query_event(event);
                 }
             }
-            // Tick — redraw every frame
+            // Tick — redraw every frame (ratatui handles diff rendering)
             _ = tick.tick() => {
                 app.spinner_tick += 1;
-                if app.needs_clear {
-                    terminal.clear()?;
-                    app.needs_clear = false;
-                }
                 terminal.draw(|frame| {
                     app.render(frame.area(), frame.buffer_mut());
                 })?;

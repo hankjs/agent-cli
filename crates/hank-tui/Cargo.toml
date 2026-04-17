@@ -7,8 +7,8 @@ edition.workspace = true
 hank-core = { path = "../hank-core" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
-ratatui = "0.29"
+ratatui = { version = "0.30", features = ["crossterm_0_28"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
-tui-textarea = { version = "0.7", features = ["crossterm"] }
-throbber-widgets-tui = "0.7"
+tui-textarea-2 = { version = "0.10", default-features = false, features = ["crossterm_0_28"] }
+throbber-widgets-tui = "0.11"
 futures = "0.3"

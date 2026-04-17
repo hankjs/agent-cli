@@ -21,8 +21,6 @@ pub struct App<'a> {
     pub running: bool,
     pub messages_text: String,
     pub scroll_offset: u16,
-    /// Set to true when scroll changes — main loop should clear terminal next frame
-    pub needs_clear: bool,
     pub auto_scroll: bool,
     pub input: TextArea<'a>,
     pub is_streaming: bool,
@@ -45,14 +43,13 @@ impl<'a> App<'a> {
         input.set_block(Block::default().borders(Borders::ALL).title(" Input "));
         input.set_cursor_line_style(Style::default());
         Self {
-            running: true, messages_text: String::new(), scroll_offset: 0,
-            auto_scroll: true, input, is_streaming: false,
+            running: true, messages_text: String::new(), scroll_offset: 0, auto_scroll: true,
+            input, is_streaming: false,
             spinner_label: String::new(), spinner_tick: 0,
             show_permission: false, permission_info: String::new(),
             permission_tx: None, model_name, msg_count: 0,
             slash_suggestions: Vec::new(),
             abort_tx: None,
-            needs_clear: true,
         }
     }
 
@@ -61,11 +58,8 @@ impl<'a> App<'a> {
         (lines + 2).clamp(3, 10) // +2 for border, min 3, max 10
     }
 
-    /// Render the entire UI into a standalone buffer (no diff rendering).
+    /// Render the entire UI — ratatui handles diff rendering automatically.
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
-        // Clear all cells first
-        Clear.render(area, buf);
-
         let input_h = self.input_height();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -174,7 +168,6 @@ impl<'a> App<'a> {
                 let new_offset = self.scroll_offset.saturating_sub(10);
                 if new_offset != self.scroll_offset {
                     self.scroll_offset = new_offset;
-                    self.needs_clear = true;
                 }
                 self.auto_scroll = false;
             }
@@ -183,7 +176,6 @@ impl<'a> App<'a> {
                 let new_offset = self.scroll_offset.saturating_add(10).min(max_scroll);
                 if new_offset != self.scroll_offset {
                     self.scroll_offset = new_offset;
-                    self.needs_clear = true;
                 }
                 self.auto_scroll = self.scroll_offset >= max_scroll;
             }
@@ -256,7 +248,6 @@ impl<'a> App<'a> {
                 let new_offset = self.scroll_offset.saturating_sub(3);
                 if new_offset != self.scroll_offset {
                     self.scroll_offset = new_offset;
-                    self.needs_clear = true;
                 }
                 self.auto_scroll = false;
             }
@@ -265,7 +256,6 @@ impl<'a> App<'a> {
                 let new_offset = self.scroll_offset.saturating_add(3).min(max_scroll);
                 if new_offset != self.scroll_offset {
                     self.scroll_offset = new_offset;
-                    self.needs_clear = true;
                 }
                 self.auto_scroll = self.scroll_offset >= max_scroll;
             }
