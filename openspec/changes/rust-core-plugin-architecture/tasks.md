@@ -16,7 +16,7 @@
 - [x] 2.4 Implement `ApiClient` struct with `stream()` method: POST to `/v1/messages` with `stream: true`, return `impl Stream<Item=Result<StreamEvent>>` via eventsource-stream on bytes_stream
 - [x] 2.5 Implement `StreamAccumulator`: HashMap<usize, String> for partial JSON, HashMap<usize, (id, name)> for tool calls, parse at content_block_stop
 - [x] 2.6 Implement retry logic: exponential backoff (1s, 2s, 4s), max 3 retries, only for 429/500/502/503/529
-- [ ] 2.7 Write integration test: send a simple message to API, verify StreamEvent sequence received
+- [x] 2.7 Write integration test: send a simple message to API, verify StreamEvent sequence received
 
 ## 3. Tool System (hank-core/tool)
 
@@ -100,6 +100,6 @@
 - [x] 10.1 Implement `main.rs`: parse CLI args (model, working dir, initial prompt), load settings, build ToolRegistry with hank_tools::register_all, build system prompt, create QueryEngine, launch TUI
 - [x] 10.2 Implement settings.json loading: permission rules, mode, MCP server configs from `~/.config/hank/settings.json`
 - [x] 10.3 Wire QueryEngine events to TUI App event handler: spawn engine task, clone TUI event sender, bridge QueryEvent → AppEvent
-- [ ] 10.4 Implement `/compact` slash command: trigger manual context compression
-- [ ] 10.5 Implement `/help` slash command: display available commands
-- [ ] 10.6 End-to-end test: launch app, send a message, verify streaming output appears, tool call executes, permission popup works
+- [x] 10.4 Implement `/compact` slash command: trigger manual context compression
+- [x] 10.5 Implement `/help` slash command: display available commands
+- [x] 10.6 End-to-end test: launch app, send a message, verify streaming output appears, tool call executes, permission popup works

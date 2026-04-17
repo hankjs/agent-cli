@@ -1,7 +1,8 @@
 use crossterm::event::{Event, EventStream};
 use futures::StreamExt;
+use hank_core::permission::PermissionChecker;
 use hank_core::prompt::{self, EnvironmentConfig};
-use hank_core::query::QueryEngine;
+use hank_core::query::{EngineCommand, QueryEngine};
 use hank_core::settings::Settings;
 use hank_core::streaming::ApiClient;
 use hank_core::tool::{ToolContext, ToolRegistry};
@@ -49,49 +50,81 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let system_prompt = prompt::build_system_prompt(&tool_prompts, &config);
 
-    // Create engine
+    // Create engine with permission checker
     let client = ApiClient::new(api_key, base_url)?;
-    let (_abort_tx, abort_rx) = tokio::sync::watch::channel(false);
+    let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
     let tool_ctx = ToolContext { working_dir, abort: abort_rx };
-    let mut engine = QueryEngine::new(client, registry, system_prompt, model.clone(), tool_ctx);
+    let (perm_mode, perm_rules) = settings.to_permission_config();
+    let permission_checker = PermissionChecker::new(perm_mode, perm_rules);
+    let mut engine = QueryEngine::new(client, registry, system_prompt, model.clone(), tool_ctx, permission_checker);
 
     // Channels
     let (query_tx, mut query_rx) = tokio::sync::mpsc::channel(256);
-    let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<String>(16);
+    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<EngineCommand>(16);
+
+    // Spawn engine task — runs independently so it doesn't block the UI loop
+    tokio::spawn(async move {
+        while let Some(cmd) = cmd_rx.recv().await {
+            engine.handle_command(cmd, &query_tx).await;
+        }
+    });
 
     // TUI setup
     crossterm::terminal::enable_raw_mode()?;
-    crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture,
+    )?;
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
 
     let mut app = App::new(model);
+    app.abort_tx = Some(abort_tx);
     let mut event_stream = EventStream::new();
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(33));
 
-    // Main loop
+    // Main loop — draw only on tick (30fps), process events without redrawing
     while app.running {
-        terminal.draw(|f| app.draw(f))?;
-        app.spinner_tick += 1;
-
         tokio::select! {
-            _ = tick.tick() => {}
-            Some(Ok(Event::Key(key))) = event_stream.next() => {
-                app.handle_key(key, &input_tx);
+            biased;
+            // User input always has priority
+            Some(Ok(event)) = event_stream.next() => {
+                match event {
+                    Event::Key(key) => app.handle_key(key, &cmd_tx),
+                    Event::Mouse(mouse) => app.handle_mouse(mouse),
+                    _ => {}
+                }
             }
+            // Engine events — drain all pending at once
             Some(event) = query_rx.recv() => {
                 app.handle_query_event(event);
+                while let Ok(event) = query_rx.try_recv() {
+                    app.handle_query_event(event);
+                }
             }
-            Some(input) = input_rx.recv() => {
-                let tx = query_tx.clone();
-                engine.submit(&input, &tx).await;
+            // Tick — redraw every frame
+            _ = tick.tick() => {
+                app.spinner_tick += 1;
+                if app.needs_clear {
+                    terminal.clear()?;
+                    app.needs_clear = false;
+                }
+                terminal.draw(|frame| {
+                    app.render(frame.area(), frame.buffer_mut());
+                })?;
             }
         }
     }
 
     // Cleanup
     crossterm::terminal::disable_raw_mode()?;
-    crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen)?;
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::event::DisableMouseCapture,
+    )?;
 
     Ok(())
 }

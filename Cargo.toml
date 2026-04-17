@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/*"]
+exclude = ["claude-code-rust"]
 resolver = "2"
 
 [workspace.package]

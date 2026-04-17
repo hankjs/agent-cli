@@ -236,3 +236,55 @@ impl ApiClient {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Integration test: sends a simple message to the Anthropic API and verifies
+    /// the SSE stream produces the expected event sequence.
+    /// Requires ANTHROPIC_API_KEY env var. Run with: cargo test --lib -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn streaming_api_returns_expected_event_sequence() {
+        let api_key = std::env::var("ANTHROPIC_API_KEY")
+            .expect("ANTHROPIC_API_KEY must be set to run integration tests");
+        let client = ApiClient::new(api_key, None).unwrap();
+
+        let body = serde_json::json!({
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "Say hello in exactly 3 words."}],
+        });
+
+        let stream = client.stream(body).await.expect("stream should start");
+        tokio::pin!(stream);
+
+        let mut saw_message_start = false;
+        let mut saw_content_block_start = false;
+        let mut saw_text_delta = false;
+        let mut saw_content_block_stop = false;
+        let mut saw_message_delta = false;
+
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(event) => match event {
+                    StreamEvent::MessageStart { .. } => saw_message_start = true,
+                    StreamEvent::ContentBlockStart { .. } => saw_content_block_start = true,
+                    StreamEvent::ContentBlockDelta { delta: Delta::TextDelta { .. }, .. } => saw_text_delta = true,
+                    StreamEvent::ContentBlockStop { .. } => saw_content_block_stop = true,
+                    StreamEvent::MessageDelta { .. } => saw_message_delta = true,
+                    StreamEvent::MessageStop { .. } => break,
+                    _ => {}
+                },
+                Err(e) => panic!("Stream error: {e}"),
+            }
+        }
+
+        assert!(saw_message_start, "expected MessageStart event");
+        assert!(saw_content_block_start, "expected ContentBlockStart event");
+        assert!(saw_text_delta, "expected at least one TextDelta event");
+        assert!(saw_content_block_stop, "expected ContentBlockStop event");
+        assert!(saw_message_delta, "expected MessageDelta event");
+    }
+}
