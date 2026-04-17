@@ -1,5 +1,7 @@
 use futures_util::StreamExt;
 use tokio::sync::{mpsc, oneshot};
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use crate::permission::{PermissionChecker, PermissionDecision, PermissionResponse, PermissionRule};
@@ -13,6 +15,206 @@ const WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Fallback model used when the primary model is persistently overloaded (529).
 const FALLBACK_MODEL: &str = "claude-sonnet-4-20250514";
+
+/// Default max_tokens per API request.
+const DEFAULT_MAX_TOKENS: u32 = 16384;
+
+// ---------------------------------------------------------------------------
+// Fuse 1: Tool Loop Detection
+// ---------------------------------------------------------------------------
+
+/// Warn after this many identical (call+result) repetitions.
+const LOOP_WARN_THRESHOLD: u32 = 5;
+/// Block the tool after this many identical repetitions.
+const LOOP_BREAK_THRESHOLD: u32 = 10;
+/// Global no-progress limit — hard stop regardless of individual tool counts.
+const GLOBAL_NO_PROGRESS_LIMIT: u32 = 30;
+
+#[derive(Debug, PartialEq)]
+enum LoopStatus {
+    Ok,
+    /// Same call+result repeated ≥ WARN times — inject a warning but keep going.
+    Warn,
+    /// Same call+result repeated ≥ BREAK times — stop this tool.
+    Break,
+    /// Total no-progress calls across all tools hit the global limit.
+    GlobalBreak,
+}
+
+struct LoopDetector {
+    /// call_fingerprint → (same-result streak, last_result_hash)
+    history: HashMap<u64, (u32, u64)>,
+    /// Cumulative no-progress calls across all tools.
+    global_no_progress: u32,
+    /// Whether a loop warning has already been injected this run.
+    warn_injected: bool,
+}
+
+impl LoopDetector {
+    fn new() -> Self {
+        Self { history: HashMap::new(), global_no_progress: 0, warn_injected: false }
+    }
+
+    /// Check a tool invocation for loop behavior.
+    /// `result` is the stringified tool output.
+    fn check(&mut self, tool_name: &str, input: &serde_json::Value, result: &str) -> LoopStatus {
+        let call_fp = Self::hash_call(tool_name, input);
+        let result_fp = Self::hash_str(result);
+
+        let entry = self.history.entry(call_fp).or_insert((0, 0));
+        if entry.1 == result_fp {
+            // Same call, same result — no progress.
+            entry.0 += 1;
+            self.global_no_progress += 1;
+        } else {
+            // Result changed — reset streak for this call.
+            entry.0 = 1;
+            entry.1 = result_fp;
+        }
+
+        if self.global_no_progress >= GLOBAL_NO_PROGRESS_LIMIT {
+            LoopStatus::GlobalBreak
+        } else if entry.0 >= LOOP_BREAK_THRESHOLD {
+            LoopStatus::Break
+        } else if entry.0 >= LOOP_WARN_THRESHOLD {
+            LoopStatus::Warn
+        } else {
+            LoopStatus::Ok
+        }
+    }
+
+    fn hash_call(name: &str, input: &serde_json::Value) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        name.hash(&mut hasher);
+        // serde_json::Value uses BTreeMap for objects — keys are already sorted.
+        let stable = serde_json::to_string(input).unwrap_or_default();
+        stable.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn hash_str(s: &str) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        s.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fuse 2: Token Budget Control
+// ---------------------------------------------------------------------------
+
+/// Default output-token budget for a single agent run.
+const DEFAULT_TOKEN_BUDGET: u64 = 200_000;
+/// Inject a nudge at this fraction of the budget.
+const BUDGET_NUDGE_RATIO: f64 = 0.9;
+/// Consecutive turns with output below this count are considered "low".
+const LOW_OUTPUT_THRESHOLD: u64 = 500;
+/// Stop after this many consecutive low-output turns.
+const LOW_STREAK_LIMIT: u32 = 2;
+/// Only check diminishing returns after this much total output.
+const MIN_OUTPUT_FOR_DIMINISH_CHECK: u64 = 5000;
+
+#[derive(Debug, PartialEq)]
+enum BudgetStatus {
+    Ok,
+    /// 90 % of budget consumed — inject a nudge.
+    Nudge,
+    /// Diminishing returns detected — stop.
+    Stop,
+}
+
+struct TokenBudget {
+    budget: u64,
+    total_output: u64,
+    low_streak: u32,
+    nudge_injected: bool,
+}
+
+impl TokenBudget {
+    fn new() -> Self {
+        let budget = std::env::var("HANK_TOKEN_BUDGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_TOKEN_BUDGET);
+        Self { budget, total_output: 0, low_streak: 0, nudge_injected: false }
+    }
+
+    fn check(&mut self, output_tokens: u64) -> BudgetStatus {
+        self.total_output += output_tokens;
+
+        // Diminishing returns: ≥2 consecutive turns with <500 tokens output,
+        // but only after we've already produced a meaningful amount.
+        if self.total_output > MIN_OUTPUT_FOR_DIMINISH_CHECK {
+            if output_tokens < LOW_OUTPUT_THRESHOLD {
+                self.low_streak += 1;
+            } else {
+                self.low_streak = 0;
+            }
+            if self.low_streak >= LOW_STREAK_LIMIT {
+                return BudgetStatus::Stop;
+            }
+        }
+
+        // 90 % budget nudge (fire once).
+        if !self.nudge_injected
+            && self.total_output as f64 >= self.budget as f64 * BUDGET_NUDGE_RATIO
+        {
+            self.nudge_injected = true;
+            return BudgetStatus::Nudge;
+        }
+
+        BudgetStatus::Ok
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fuse 3: Output Truncation Recovery
+// ---------------------------------------------------------------------------
+
+/// Maximum recovery attempts before giving up.
+const MAX_TRUNCATION_RECOVERY: u32 = 3;
+/// Elevated max_tokens used on first recovery attempt.
+const ELEVATED_MAX_TOKENS: u32 = 65536;
+
+struct TruncationRecovery {
+    count: u32,
+}
+
+impl TruncationRecovery {
+    fn new() -> Self { Self { count: 0 } }
+
+    /// Returns `true` if we should retry (haven't exhausted recovery attempts).
+    fn should_retry(&mut self) -> bool {
+        self.count += 1;
+        self.count <= MAX_TRUNCATION_RECOVERY
+    }
+
+    fn recovery_message(&self) -> &str {
+        if self.count <= 1 {
+            "Your output was truncated due to token limits. Continue directly from where you left off — do not apologize, do not recap what you were doing. Break remaining work into smaller chunks."
+        } else {
+            "Output truncated again. Significantly reduce your output — only give key conclusions and essential information."
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Max turns limit
+// ---------------------------------------------------------------------------
+
+/// Hard cap on the number of agent turns per user message.
+const DEFAULT_MAX_TURNS: u32 = 200;
+
+fn max_turns_limit() -> u32 {
+    std::env::var("HANK_MAX_TURNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_TURNS)
+}
+
+// ---------------------------------------------------------------------------
+// QueryEngine types
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub enum SpinnerMode {
@@ -75,11 +277,7 @@ impl QueryEngine {
     pub fn messages(&self) -> &[Message] { &self.messages }
 
     pub fn add_user_message(&mut self, text: &str) {
-        self.messages.push(Message {
-            role: "user".into(),
-            content: vec![ContentBlock::Text { text: text.into() }],
-            id: None,
-        });
+        self.messages.push(Message::new("user", vec![ContentBlock::Text { text: text.into() }]));
     }
 
     /// Submit a user message and run the query loop, sending events to tx.
@@ -104,10 +302,10 @@ impl QueryEngine {
         }
     }
 
-    fn build_request_body(&self) -> serde_json::Value {
+    fn build_request_body(&self, max_tokens: u32) -> serde_json::Value {
         serde_json::json!({
             "model": self.model,
-            "max_tokens": 16384,
+            "max_tokens": max_tokens,
             "system": self.system_prompt,
             "messages": self.messages,
             "tools": self.registry.api_definitions(),
@@ -119,38 +317,40 @@ impl QueryEngine {
         // fallback) so that failure budgets are continuous.
         let mut retry_state = RetryState::new();
 
+        // Three fuses — freshly created per agent run.
+        let mut loop_detector = LoopDetector::new();
+        let mut token_budget = TokenBudget::new();
+        let mut truncation_recovery = TruncationRecovery::new();
+
+        let max_turns = max_turns_limit();
+        let mut turn = 0u32;
+        let mut max_tokens = DEFAULT_MAX_TOKENS;
+
         loop {
+            // --- Max turns check ---
+            turn += 1;
+            if turn > max_turns {
+                let _ = tx.send(QueryEvent::Error(
+                    format!("Reached maximum turn limit ({max_turns}). Stopping to prevent runaway execution.")
+                )).await;
+                let _ = tx.send(QueryEvent::TurnComplete).await;
+                return;
+            }
+
             let _ = tx.send(QueryEvent::Spinner(SpinnerMode::Requesting)).await;
-            let body = self.build_request_body();
+            let body = self.build_request_body(max_tokens);
 
             // --- Try streaming first ---
             let stream_result = self.run_stream(body.clone(), &mut retry_state, tx).await;
 
-            match stream_result {
-                StreamOutcome::Done(assistant_content, stop_reason) => {
-                    // Normal completion — process tool calls or finish turn.
-                    if let Some(next) = self.process_response(assistant_content, stop_reason, tx).await {
-                        match next {
-                            TurnAction::Continue => continue,
-                            TurnAction::Finish => return,
-                        }
-                    }
-                    return;
-                }
+            let (assistant_content, stop_reason, output_tokens) = match stream_result {
+                StreamOutcome::Done(content, stop, tokens) => (content, stop, tokens),
                 StreamOutcome::Aborted => return,
                 StreamOutcome::StreamFailed => {
                     // Streaming failed — fall back to non-streaming request.
                     let fallback = self.run_non_stream(body, &mut retry_state, tx).await;
                     match fallback {
-                        Some((assistant_content, stop_reason)) => {
-                            if let Some(next) = self.process_response(assistant_content, stop_reason, tx).await {
-                                match next {
-                                    TurnAction::Continue => continue,
-                                    TurnAction::Finish => return,
-                                }
-                            }
-                            return;
-                        }
+                        Some((content, stop, tokens)) => (content, stop, tokens),
                         None => return, // error already sent
                     }
                 }
@@ -165,7 +365,69 @@ impl QueryEngine {
                     )).await;
                     return;
                 }
+            };
+
+            // --- Fuse 2: Token budget check ---
+            let budget_status = token_budget.check(output_tokens);
+            match budget_status {
+                BudgetStatus::Stop => {
+                    // Commit whatever the assistant said, then stop.
+                    self.messages.push(Message::new("assistant", assistant_content));
+                    let _ = tx.send(QueryEvent::Error(
+                        format!(
+                            "Token budget: diminishing returns detected (total output: {} tokens). Stopping.",
+                            token_budget.total_output
+                        )
+                    )).await;
+                    let _ = tx.send(QueryEvent::TurnComplete).await;
+                    return;
+                }
+                BudgetStatus::Nudge | BudgetStatus::Ok => {
+                    // Nudge will be injected into the next tool-results message if applicable.
+                }
             }
+
+            // --- Fuse 3: Truncation recovery ---
+            if matches!(stop_reason, Some(StopReason::MaxTokens)) {
+                // Keep the partial assistant output in history.
+                self.messages.push(Message::new("assistant", assistant_content));
+
+                if truncation_recovery.should_retry() {
+                    // Step 1: raise max_tokens on first attempt.
+                    if truncation_recovery.count == 1 {
+                        max_tokens = ELEVATED_MAX_TOKENS;
+                    }
+                    // Step 2: inject recovery instruction.
+                    let recovery_msg = truncation_recovery.recovery_message().to_string();
+                    let _ = tx.send(QueryEvent::TextDelta(
+                        format!("\n[Truncation recovery {}/{}]\n", truncation_recovery.count, MAX_TRUNCATION_RECOVERY)
+                    )).await;
+                    self.messages.push(Message::new("user", vec![ContentBlock::Text { text: recovery_msg }]));
+                    continue; // retry with recovery message
+                } else {
+                    let _ = tx.send(QueryEvent::Error(
+                        format!(
+                            "Output truncated {} times. Partial results preserved.",
+                            MAX_TRUNCATION_RECOVERY
+                        )
+                    )).await;
+                    let _ = tx.send(QueryEvent::TurnComplete).await;
+                    return;
+                }
+            }
+
+            // --- Normal processing (tool calls or end_turn) ---
+            let inject_nudge = budget_status == BudgetStatus::Nudge;
+            if let Some(next) = self.process_response(
+                assistant_content, stop_reason, tx,
+                &mut loop_detector, inject_nudge, &token_budget,
+            ).await {
+                match next {
+                    TurnAction::Continue => continue,
+                    TurnAction::Finish => return,
+                }
+            }
+            return;
         }
     }
 
@@ -198,6 +460,7 @@ impl QueryEngine {
         let mut assistant_content: Vec<ContentBlock> = Vec::new();
         let mut last_data_at = Instant::now();
         let mut watchdog_interval = tokio::time::interval(WATCHDOG_CHECK_INTERVAL);
+        let mut output_tokens: u64 = 0;
 
         let mut aborted = false;
         let mut stream_error = false;
@@ -258,8 +521,14 @@ impl QueryEngine {
                                     assistant_content.push(ContentBlock::Text { text });
                                 }
                             }
-                            StreamEvent::MessageDelta { delta, .. } => {
+                            StreamEvent::MessageDelta { delta, usage } => {
                                 stop_reason = delta.stop_reason;
+                                // Capture output token count for budget tracking.
+                                if let Some(u) = usage {
+                                    if let Some(t) = u.output_tokens {
+                                        output_tokens = t;
+                                    }
+                                }
                             }
                             StreamEvent::Error { error } => {
                                 let _ = tx.send(QueryEvent::Error(error.message)).await;
@@ -292,20 +561,24 @@ impl QueryEngine {
         if stream_error {
             // Stream broke mid-flight. Keep only complete content blocks
             // (discard incomplete tool_use whose JSON hasn't closed).
-            // Complete text and tool_use blocks already in assistant_content are safe.
             return StreamOutcome::StreamFailed;
         }
 
-        StreamOutcome::Done(assistant_content, stop_reason)
+        // If the API didn't report output_tokens, estimate from the content.
+        if output_tokens == 0 {
+            output_tokens = Self::estimate_content_tokens(&assistant_content);
+        }
+
+        StreamOutcome::Done(assistant_content, stop_reason, output_tokens)
     }
 
-    /// Non-streaming fallback. Returns parsed content blocks + stop reason, or None on error.
+    /// Non-streaming fallback. Returns parsed content blocks + stop reason + output tokens, or None on error.
     async fn run_non_stream(
         &self,
         body: serde_json::Value,
         retry_state: &mut RetryState,
         tx: &mpsc::Sender<QueryEvent>,
-    ) -> Option<(Vec<ContentBlock>, Option<StopReason>)> {
+    ) -> Option<(Vec<ContentBlock>, Option<StopReason>, u64)> {
         let mut retry_state_clone = retry_state.clone();
         let msg = match self.client.send(body, &mut retry_state_clone).await {
             Ok(m) => {
@@ -344,26 +617,31 @@ impl QueryEngine {
             }
         }
 
-        // Determine stop reason from the content.
-        let has_tool_use = msg.content.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. }));
-        let stop = if has_tool_use { Some(StopReason::ToolUse) } else { Some(StopReason::EndTurn) };
+        // Use the actual stop_reason and output_tokens from the API response.
+        let output_tokens = msg.usage_output_tokens.unwrap_or_else(
+            || Self::estimate_content_tokens(&msg.content)
+        );
+        let stop_reason = msg.stop_reason.or_else(|| {
+            let has_tool_use = msg.content.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+            if has_tool_use { Some(StopReason::ToolUse) } else { Some(StopReason::EndTurn) }
+        });
 
-        Some((msg.content, stop))
+        Some((msg.content, stop_reason, output_tokens))
     }
 
     /// Process a complete response: commit to message history, handle tool calls.
+    /// Now also performs loop detection and optionally injects budget nudge.
     async fn process_response(
         &mut self,
         assistant_content: Vec<ContentBlock>,
         stop_reason: Option<StopReason>,
         tx: &mpsc::Sender<QueryEvent>,
+        loop_detector: &mut LoopDetector,
+        inject_nudge: bool,
+        token_budget: &TokenBudget,
     ) -> Option<TurnAction> {
         // Append assistant message
-        self.messages.push(Message {
-            role: "assistant".into(),
-            content: assistant_content.clone(),
-            id: None,
-        });
+        self.messages.push(Message::new("assistant", assistant_content.clone()));
 
         // Check if we need to execute tools
         let tool_calls: Vec<_> = assistant_content.iter().filter_map(|b| {
@@ -440,6 +718,12 @@ impl QueryEngine {
                 // Execute approved tool calls
                 if !approved_calls.is_empty() {
                     let _ = tx.send(QueryEvent::Spinner(SpinnerMode::ToolExecuting)).await;
+
+                    // Snapshot tool names+inputs for loop detection (before move).
+                    let call_info: Vec<(String, String, serde_json::Value)> = approved_calls.iter()
+                        .map(|(id, name, input)| (id.clone(), name.clone(), input.clone()))
+                        .collect();
+
                     let results = ToolExecutor::execute(&self.registry, approved_calls, &self.tool_ctx).await;
 
                     for (id, result) in results {
@@ -460,6 +744,56 @@ impl QueryEngine {
                                 (msg, true)
                             }
                         };
+
+                        // --- Fuse 1: Loop detection ---
+                        if let Some(info) = call_info.iter().find(|(cid, _, _)| cid == &id) {
+                            let status = loop_detector.check(&info.1, &info.2, &content);
+                            match status {
+                                LoopStatus::GlobalBreak => {
+                                    let _ = tx.send(QueryEvent::Error(
+                                        format!(
+                                            "Global loop fuse triggered: {} no-progress tool calls. Stopping.",
+                                            GLOBAL_NO_PROGRESS_LIMIT
+                                        )
+                                    )).await;
+                                    // Still commit the tool results we have so far.
+                                    tool_results.push(serde_json::json!({
+                                        "type": "tool_result",
+                                        "tool_use_id": id,
+                                        "content": content,
+                                        "is_error": is_error,
+                                    }));
+                                    self.push_tool_results(tool_results);
+                                    let _ = tx.send(QueryEvent::TurnComplete).await;
+                                    return Some(TurnAction::Finish);
+                                }
+                                LoopStatus::Break => {
+                                    let _ = tx.send(QueryEvent::Error(
+                                        format!(
+                                            "Loop detected: tool '{}' called {} times with identical results. Stopping.",
+                                            info.1, LOOP_BREAK_THRESHOLD
+                                        )
+                                    )).await;
+                                    tool_results.push(serde_json::json!({
+                                        "type": "tool_result",
+                                        "tool_use_id": id,
+                                        "content": content,
+                                        "is_error": is_error,
+                                    }));
+                                    self.push_tool_results(tool_results);
+                                    let _ = tx.send(QueryEvent::TurnComplete).await;
+                                    return Some(TurnAction::Finish);
+                                }
+                                LoopStatus::Warn => {
+                                    // Inject warning once.
+                                    if !loop_detector.warn_injected {
+                                        loop_detector.warn_injected = true;
+                                    }
+                                }
+                                LoopStatus::Ok => {}
+                            }
+                        }
+
                         tool_results.push(serde_json::json!({
                             "type": "tool_result",
                             "tool_use_id": id,
@@ -469,22 +803,53 @@ impl QueryEngine {
                     }
                 }
 
-                self.messages.push(Message {
-                    role: "user".into(),
-                    content: vec![ContentBlock::Text {
-                        text: serde_json::to_string(&tool_results).unwrap_or_default()
-                    }],
-                    id: None,
-                });
+                // Build the tool-results user message, optionally with fuse warnings.
+                let mut extra_text = String::new();
+
+                // Fuse 1: loop warning
+                if loop_detector.warn_injected {
+                    extra_text.push_str(
+                        "[LOOP_WARNING] You are repeatedly calling the same tool with the same arguments and getting the same results. \
+                         This indicates no progress. Please try a different approach or tool to accomplish the task.\n"
+                    );
+                    // Reset so we only inject once per detection.
+                    loop_detector.warn_injected = false;
+                }
+
+                // Fuse 2: budget nudge
+                if inject_nudge {
+                    let pct = (token_budget.total_output as f64 / token_budget.budget as f64 * 100.0) as u32;
+                    extra_text.push_str(&format!(
+                        "[BUDGET_NUDGE] Output token budget is {pct}% consumed ({}/{}). \
+                         Please be concise and focus on completing the task efficiently. \
+                         Continue working — do not summarize what you have done so far.\n",
+                        token_budget.total_output, token_budget.budget
+                    ));
+                }
+
+                let mut content_blocks = vec![ContentBlock::Text {
+                    text: serde_json::to_string(&tool_results).unwrap_or_default()
+                }];
+                if !extra_text.is_empty() {
+                    content_blocks.push(ContentBlock::Text { text: extra_text });
+                }
+                self.messages.push(Message::new("user", content_blocks));
                 Some(TurnAction::Continue)
             }
             _ => {
-                // end_turn or max_tokens — done
+                // end_turn — done
                 self.maybe_compress();
                 let _ = tx.send(QueryEvent::TurnComplete).await;
                 Some(TurnAction::Finish)
             }
         }
+    }
+
+    /// Push tool results as a user message.
+    fn push_tool_results(&mut self, tool_results: Vec<serde_json::Value>) {
+        self.messages.push(Message::new("user", vec![ContentBlock::Text {
+            text: serde_json::to_string(&tool_results).unwrap_or_default()
+        }]));
     }
 
     /// Try to degrade the model. Returns true if degradation happened.
@@ -503,11 +868,16 @@ impl QueryEngine {
 
     /// Push partial assistant text to messages (used on abort).
     fn messages_push_partial(&mut self, text: String) {
-        self.messages.push(Message {
-            role: "assistant".into(),
-            content: vec![ContentBlock::Text { text }],
-            id: None,
-        });
+        self.messages.push(Message::new("assistant", vec![ContentBlock::Text { text }]));
+    }
+
+    /// Estimate token count from content blocks (rough: 1 token ≈ 4 chars).
+    fn estimate_content_tokens(content: &[ContentBlock]) -> u64 {
+        content.iter().map(|b| match b {
+            ContentBlock::Text { text } => text.len() as u64 / 4,
+            ContentBlock::ToolUse { input, .. } => input.to_string().len() as u64 / 4,
+            ContentBlock::Thinking { thinking } => thinking.len() as u64 / 4,
+        }).sum()
     }
 
     fn estimate_tokens(&self) -> usize {
@@ -536,11 +906,7 @@ impl QueryEngine {
     fn do_compress(&mut self) {
         let keep = self.messages.split_off(self.messages.len() - 6);
         let summary = "[Earlier conversation compressed]".to_string();
-        self.messages = vec![Message {
-            role: "user".into(),
-            content: vec![ContentBlock::Text { text: summary }],
-            id: None,
-        }];
+        self.messages = vec![Message::new("user", vec![ContentBlock::Text { text: summary }])];
         self.messages.extend(keep);
     }
 
@@ -551,8 +917,8 @@ impl QueryEngine {
 
 /// Outcome of a streaming attempt.
 enum StreamOutcome {
-    /// Stream completed successfully with content blocks and stop reason.
-    Done(Vec<ContentBlock>, Option<StopReason>),
+    /// Stream completed successfully with content blocks, stop reason, and output token count.
+    Done(Vec<ContentBlock>, Option<StopReason>, u64),
     /// User aborted the stream.
     Aborted,
     /// Stream failed (network error, SSE error, watchdog timeout).
@@ -594,6 +960,77 @@ mod tests {
             let text = input.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
             Ok(ToolResult { data: serde_json::Value::String(text), new_messages: None })
         }
+    }
+
+    #[test]
+    fn loop_detector_warns_and_breaks() {
+        let mut det = LoopDetector::new();
+        let input = serde_json::json!({"path": "/tmp/foo"});
+        let result = "file content here";
+
+        for _ in 0..4 {
+            assert_eq!(det.check("read_file", &input, result), LoopStatus::Ok);
+        }
+        // 5th same call+result → Warn
+        assert_eq!(det.check("read_file", &input, result), LoopStatus::Warn);
+
+        for _ in 0..4 {
+            det.check("read_file", &input, result);
+        }
+        // 10th → Break
+        assert_eq!(det.check("read_file", &input, result), LoopStatus::Break);
+    }
+
+    #[test]
+    fn loop_detector_resets_on_different_result() {
+        let mut det = LoopDetector::new();
+        let input = serde_json::json!({"path": "/tmp/foo"});
+
+        for i in 0..8 {
+            det.check("read_file", &input, &format!("content v{i}"));
+        }
+        // Each call had a different result → all Ok, no streak.
+        assert_eq!(det.global_no_progress, 0);
+    }
+
+    #[test]
+    fn loop_detector_global_break() {
+        let mut det = LoopDetector::new();
+        // Simulate 30 no-progress calls by directly setting the counter,
+        // then verify the next no-progress call triggers GlobalBreak.
+        det.global_no_progress = 29;
+        let input = serde_json::json!({"x": 1});
+        // First call for this tool — sets the baseline (result_hash changes from 0 → hash("same")).
+        det.check("tool_x", &input, "same");
+        // Second call — same result, increments global_no_progress to 30.
+        assert_eq!(det.check("tool_x", &input, "same"), LoopStatus::GlobalBreak);
+    }
+
+    #[test]
+    fn token_budget_nudge_and_stop() {
+        let mut budget = TokenBudget {
+            budget: 10000,
+            total_output: 0,
+            low_streak: 0,
+            nudge_injected: false,
+        };
+        // Below 90%
+        assert_eq!(budget.check(5000), BudgetStatus::Ok);
+        // Crosses 90%
+        assert_eq!(budget.check(4500), BudgetStatus::Nudge);
+        // Nudge already injected
+        assert_eq!(budget.check(100), BudgetStatus::Ok);
+        // Diminishing returns (two consecutive low outputs after 5000 total)
+        assert_eq!(budget.check(100), BudgetStatus::Stop);
+    }
+
+    #[test]
+    fn truncation_recovery_limits() {
+        let mut tr = TruncationRecovery::new();
+        assert!(tr.should_retry()); // 1
+        assert!(tr.should_retry()); // 2
+        assert!(tr.should_retry()); // 3
+        assert!(!tr.should_retry()); // 4 — exceeded
     }
 
     /// End-to-end integration test: submit a message to the real API, verify

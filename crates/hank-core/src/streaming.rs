@@ -90,6 +90,25 @@ pub struct Message {
     pub content: Vec<ContentBlock>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// Stop reason from the API response (non-streaming only).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub stop_reason: Option<StopReason>,
+    /// Output token count from the API response (non-streaming only).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub usage_output_tokens: Option<u64>,
+}
+
+impl Message {
+    /// Create a new message with only role and content (no metadata).
+    pub fn new(role: impl Into<String>, content: Vec<ContentBlock>) -> Self {
+        Self {
+            role: role.into(),
+            content,
+            id: None,
+            stop_reason: None,
+            usage_output_tokens: None,
+        }
+    }
 }
 
 /// Accumulates partial JSON fragments for tool_use inputs during streaming.
@@ -445,10 +464,28 @@ fn parse_non_stream_response(json: serde_json::Value) -> Result<Message, ApiClie
         }
     }
 
+    // Parse stop_reason from the response.
+    let stop_reason = json.get("stop_reason")
+        .and_then(|v| v.as_str())
+        .and_then(|s| match s {
+            "end_turn" => Some(StopReason::EndTurn),
+            "tool_use" => Some(StopReason::ToolUse),
+            "max_tokens" => Some(StopReason::MaxTokens),
+            "stop_sequence" => Some(StopReason::StopSequence),
+            _ => None,
+        });
+
+    // Parse output_tokens from usage.
+    let usage_output_tokens = json.get("usage")
+        .and_then(|u| u.get("output_tokens"))
+        .and_then(|v| v.as_u64());
+
     Ok(Message {
         role,
         content: blocks,
         id: json.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        stop_reason,
+        usage_output_tokens,
     })
 }
 
