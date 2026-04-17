@@ -2,6 +2,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::time::Duration;
 
 /// SSE stream event types from the Anthropic Messages API.
 #[derive(Debug, Clone, Deserialize)]
@@ -142,12 +143,86 @@ impl StreamAccumulator {
     }
 }
 
-/// Streaming API client for the Anthropic Messages API.
-pub struct ApiClient {
-    api_key: String,
-    base_url: String,
-    http: reqwest::Client,
+// ---------------------------------------------------------------------------
+// Error classification
+// ---------------------------------------------------------------------------
+
+/// How an HTTP error should be handled.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ErrorCategory {
+    /// Transient — worth retrying with backoff (429, 500, 502, 503, 408, connection reset).
+    Retryable,
+    /// Client-side problem — retrying won't help (400, 401, 402, 403, 404).
+    NonRetryable,
+    /// Persistent overload — retry a few times then escalate to degradation (529).
+    NeedsDegradation,
 }
+
+fn classify_status(status: u16) -> ErrorCategory {
+    match status {
+        429 | 500 | 502 | 503 | 408 => ErrorCategory::Retryable,
+        529 => ErrorCategory::NeedsDegradation,
+        _ => ErrorCategory::NonRetryable,
+    }
+}
+
+/// Retry state passed between streaming and non-streaming attempts so failure
+/// budgets are shared across the two layers.
+#[derive(Debug, Clone, Default)]
+pub struct RetryState {
+    /// Total attempts so far (across stream + non-stream).
+    pub attempts: u32,
+    /// Consecutive 529 errors.
+    pub consecutive_529: u32,
+}
+
+impl RetryState {
+    pub fn new() -> Self { Self::default() }
+
+    /// Returns true when consecutive 529s reach the degradation threshold.
+    pub fn should_degrade(&self) -> bool {
+        self.consecutive_529 >= MAX_529_BEFORE_DEGRADE
+    }
+}
+
+/// Maximum consecutive 529 errors before triggering model degradation.
+const MAX_529_BEFORE_DEGRADE: u32 = 3;
+/// Base delay for exponential backoff (milliseconds).
+const BACKOFF_BASE_MS: u64 = 500;
+/// Maximum delay cap (milliseconds).
+const BACKOFF_MAX_MS: u64 = 60_000;
+
+fn max_retries() -> u32 {
+    std::env::var("HANK_MAX_RETRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10)
+}
+
+/// Calculate backoff delay with exponential growth + random jitter.
+/// If the server sent a `Retry-After` header, that value takes precedence.
+fn backoff_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
+    if let Some(ra) = retry_after {
+        return ra;
+    }
+    // Exponential: 500ms, 1s, 2s, 4s, ...
+    let base = BACKOFF_BASE_MS.saturating_mul(1u64 << attempt.min(12));
+    let capped = base.min(BACKOFF_MAX_MS);
+    // Jitter: random value in [0, capped)
+    let jitter = fastrand::u64(0..capped.max(1));
+    Duration::from_millis(capped + jitter)
+}
+
+/// Parse the `Retry-After` header value (seconds) into a Duration.
+fn parse_retry_after(resp: &reqwest::Response) -> Option<Duration> {
+    let val = resp.headers().get("retry-after")?.to_str().ok()?;
+    let secs: f64 = val.parse().ok()?;
+    Some(Duration::from_secs_f64(secs))
+}
+
+// ---------------------------------------------------------------------------
+// ApiClient
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApiClientError {
@@ -161,9 +236,16 @@ pub enum ApiClientError {
     SseParse(String),
     #[error("Max retries exceeded after {attempts} attempts: {last_error}")]
     MaxRetries { attempts: u32, last_error: String },
+    #[error("Overloaded: model unavailable after {attempts} attempts (529)")]
+    Overloaded { attempts: u32 },
 }
 
-const RETRYABLE_STATUSES: &[u16] = &[429, 500, 502, 503, 529];
+/// Streaming API client for the Anthropic Messages API.
+pub struct ApiClient {
+    api_key: String,
+    base_url: String,
+    http: reqwest::Client,
+}
 
 impl ApiClient {
     pub fn new(api_key: String, base_url: Option<String>) -> Result<Self, ApiClientError> {
@@ -178,21 +260,22 @@ impl ApiClient {
     }
 
     /// Send a streaming request, returning a stream of StreamEvents.
-    /// Retries on transient errors with exponential backoff.
+    /// Retries on transient errors with exponential backoff + jitter.
+    /// Tracks 529 errors in `retry_state` for cross-layer degradation.
     pub async fn stream(
         &self,
         body: serde_json::Value,
+        retry_state: &mut RetryState,
     ) -> Result<Pin<Box<dyn futures_util::Stream<Item = Result<StreamEvent, ApiClientError>> + Send>>, ApiClientError> {
         use eventsource_stream::Eventsource;
 
         let mut body = body;
         body.as_object_mut().unwrap().insert("stream".into(), serde_json::Value::Bool(true));
 
-        let mut attempts = 0u32;
-        let max_retries = 3u32;
+        let max = max_retries();
 
         loop {
-            attempts += 1;
+            retry_state.attempts += 1;
             let resp = self.http
                 .post(format!("{}/v1/messages", self.base_url))
                 .header("x-api-key", &self.api_key)
@@ -204,18 +287,43 @@ impl ApiClient {
 
             let status = resp.status().as_u16();
             if !resp.status().is_success() {
-                let is_retryable = RETRYABLE_STATUSES.contains(&status);
-                if is_retryable && attempts <= max_retries {
-                    let delay = 1u64 << (attempts - 1); // 1s, 2s, 4s
-                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                    continue;
+                let category = classify_status(status);
+                let retry_after = parse_retry_after(&resp);
+
+                match category {
+                    ErrorCategory::NonRetryable => {
+                        let body_text = resp.text().await.unwrap_or_default();
+                        return Err(ApiClientError::Http { status, body: body_text });
+                    }
+                    ErrorCategory::NeedsDegradation => {
+                        retry_state.consecutive_529 += 1;
+                        if retry_state.should_degrade() {
+                            return Err(ApiClientError::Overloaded { attempts: retry_state.attempts });
+                        }
+                        if retry_state.attempts > max {
+                            let body_text = resp.text().await.unwrap_or_default();
+                            return Err(ApiClientError::MaxRetries { attempts: retry_state.attempts, last_error: body_text });
+                        }
+                        let delay = backoff_delay(retry_state.attempts - 1, retry_after);
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    ErrorCategory::Retryable => {
+                        // Non-529 retryable errors reset the 529 counter.
+                        retry_state.consecutive_529 = 0;
+                        if retry_state.attempts > max {
+                            let body_text = resp.text().await.unwrap_or_default();
+                            return Err(ApiClientError::MaxRetries { attempts: retry_state.attempts, last_error: body_text });
+                        }
+                        let delay = backoff_delay(retry_state.attempts - 1, retry_after);
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
                 }
-                let body_text = resp.text().await.unwrap_or_default();
-                if attempts > max_retries && is_retryable {
-                    return Err(ApiClientError::MaxRetries { attempts, last_error: body_text });
-                }
-                return Err(ApiClientError::Http { status, body: body_text });
             }
+
+            // Success — reset 529 counter.
+            retry_state.consecutive_529 = 0;
 
             let stream = resp.bytes_stream().eventsource().filter_map(|result| async move {
                 match result {
@@ -235,11 +343,172 @@ impl ApiClient {
             return Ok(Box::pin(stream));
         }
     }
+
+    /// Non-streaming request. Used as a fallback when streaming repeatedly fails.
+    /// Shares the same `RetryState` so failure budgets are continuous.
+    pub async fn send(
+        &self,
+        body: serde_json::Value,
+        retry_state: &mut RetryState,
+    ) -> Result<Message, ApiClientError> {
+        let mut body = body;
+        // Ensure stream is false for non-streaming.
+        body.as_object_mut().unwrap().remove("stream");
+
+        let max = max_retries();
+
+        loop {
+            retry_state.attempts += 1;
+            let resp = self.http
+                .post(format!("{}/v1/messages", self.base_url))
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&body)
+                .timeout(Duration::from_secs(120))
+                .send()
+                .await?;
+
+            let status = resp.status().as_u16();
+            if !resp.status().is_success() {
+                let category = classify_status(status);
+                let retry_after = parse_retry_after(&resp);
+
+                match category {
+                    ErrorCategory::NonRetryable => {
+                        let body_text = resp.text().await.unwrap_or_default();
+                        return Err(ApiClientError::Http { status, body: body_text });
+                    }
+                    ErrorCategory::NeedsDegradation => {
+                        retry_state.consecutive_529 += 1;
+                        if retry_state.should_degrade() {
+                            return Err(ApiClientError::Overloaded { attempts: retry_state.attempts });
+                        }
+                        if retry_state.attempts > max {
+                            let body_text = resp.text().await.unwrap_or_default();
+                            return Err(ApiClientError::MaxRetries { attempts: retry_state.attempts, last_error: body_text });
+                        }
+                        let delay = backoff_delay(retry_state.attempts - 1, retry_after);
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    ErrorCategory::Retryable => {
+                        retry_state.consecutive_529 = 0;
+                        if retry_state.attempts > max {
+                            let body_text = resp.text().await.unwrap_or_default();
+                            return Err(ApiClientError::MaxRetries { attempts: retry_state.attempts, last_error: body_text });
+                        }
+                        let delay = backoff_delay(retry_state.attempts - 1, retry_after);
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                }
+            }
+
+            // Parse the non-streaming response.
+            retry_state.consecutive_529 = 0;
+            let json: serde_json::Value = resp.json().await?;
+            let content = parse_non_stream_response(json)?;
+            return Ok(content);
+        }
+    }
+}
+
+/// Parse a non-streaming Messages API response into a Message.
+fn parse_non_stream_response(json: serde_json::Value) -> Result<Message, ApiClientError> {
+    let role = json.get("role")
+        .and_then(|v| v.as_str())
+        .unwrap_or("assistant")
+        .to_string();
+
+    let mut blocks = Vec::new();
+    if let Some(content) = json.get("content").and_then(|c| c.as_array()) {
+        for item in content {
+            let block_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            match block_type {
+                "text" => {
+                    let text = item.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                    blocks.push(ContentBlock::Text { text });
+                }
+                "tool_use" => {
+                    let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let input = item.get("input").cloned().unwrap_or(serde_json::Value::Object(Default::default()));
+                    blocks.push(ContentBlock::ToolUse { id, name, input });
+                }
+                "thinking" => {
+                    let thinking = item.get("thinking").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                    blocks.push(ContentBlock::Thinking { thinking });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(Message {
+        role,
+        content: blocks,
+        id: json.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_classification() {
+        assert_eq!(classify_status(429), ErrorCategory::Retryable);
+        assert_eq!(classify_status(500), ErrorCategory::Retryable);
+        assert_eq!(classify_status(503), ErrorCategory::Retryable);
+        assert_eq!(classify_status(408), ErrorCategory::Retryable);
+        assert_eq!(classify_status(529), ErrorCategory::NeedsDegradation);
+        assert_eq!(classify_status(400), ErrorCategory::NonRetryable);
+        assert_eq!(classify_status(401), ErrorCategory::NonRetryable);
+        assert_eq!(classify_status(402), ErrorCategory::NonRetryable);
+        assert_eq!(classify_status(403), ErrorCategory::NonRetryable);
+    }
+
+    #[test]
+    fn backoff_delay_grows_exponentially() {
+        let d0 = backoff_delay(0, None);
+        let d1 = backoff_delay(1, None);
+        let d2 = backoff_delay(2, None);
+        // Base: 500ms, 1000ms, 2000ms + jitter
+        assert!(d0.as_millis() >= 500);
+        assert!(d1.as_millis() >= 1000);
+        assert!(d2.as_millis() >= 2000);
+    }
+
+    #[test]
+    fn backoff_respects_retry_after() {
+        let d = backoff_delay(0, Some(Duration::from_secs(10)));
+        assert_eq!(d.as_secs(), 10);
+    }
+
+    #[test]
+    fn retry_state_degrades_after_threshold() {
+        let mut state = RetryState::new();
+        state.consecutive_529 = 2;
+        assert!(!state.should_degrade());
+        state.consecutive_529 = 3;
+        assert!(state.should_degrade());
+    }
+
+    #[test]
+    fn parse_non_stream_response_works() {
+        let json = serde_json::json!({
+            "id": "msg_123",
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Hello!"},
+                {"type": "tool_use", "id": "tu_1", "name": "read", "input": {"path": "/tmp"}}
+            ]
+        });
+        let msg = parse_non_stream_response(json).unwrap();
+        assert_eq!(msg.role, "assistant");
+        assert_eq!(msg.content.len(), 2);
+    }
 
     /// Integration test: sends a simple message to the Anthropic API and verifies
     /// the SSE stream produces the expected event sequence.
@@ -257,7 +526,8 @@ mod tests {
             "messages": [{"role": "user", "content": "Say hello in exactly 3 words."}],
         });
 
-        let stream = client.stream(body).await.expect("stream should start");
+        let mut retry_state = RetryState::new();
+        let stream = client.stream(body, &mut retry_state).await.expect("stream should start");
         tokio::pin!(stream);
 
         let mut saw_message_start = false;

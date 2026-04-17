@@ -243,6 +243,10 @@ impl<'a> App<'a> {
                 self.messages_text.push_str(&format!("\n[error: {msg}]\n"));
                 self.is_streaming = false;
             }
+            QueryEvent::ModelDegraded { from, to } => {
+                self.messages_text.push_str(&format!("\n[Model degraded: {from} -> {to} due to overload]\n"));
+                if self.auto_scroll { self.scroll_to_bottom(); }
+            }
         }
     }
 
