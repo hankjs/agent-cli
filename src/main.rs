@@ -9,6 +9,7 @@ use hank_core::tool::{ToolContext, ToolRegistry};
 use hank_tui::app::App;
 use ratatui::prelude::*;
 use std::env;
+use std::io::Write;
 use std::path::PathBuf;
 
 #[tokio::main]
@@ -74,8 +75,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     crossterm::execute!(
         std::io::stdout(),
         crossterm::terminal::EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture,
     )?;
+    // Enable alternate scroll mode: scroll wheel sends Up/Down key events
+    // instead of requiring mouse capture, so text selection still works natively.
+    write!(std::io::stdout(), "\x1b[?1007h")?;
+    std::io::stdout().flush()?;
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -90,12 +94,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::select! {
             biased;
             // User input always has priority
-            Some(Ok(event)) = event_stream.next() => {
-                match event {
-                    Event::Key(key) => app.handle_key(key, &cmd_tx),
-                    Event::Mouse(mouse) => app.handle_mouse(mouse),
-                    _ => {}
-                }
+            Some(Ok(Event::Key(key))) = event_stream.next() => {
+                app.handle_key(key, &cmd_tx);
             }
             // Engine events — drain all pending at once
             Some(event) = query_rx.recv() => {
@@ -115,11 +115,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Cleanup
+    write!(std::io::stdout(), "\x1b[?1007l")?;
+    std::io::stdout().flush()?;
     crossterm::terminal::disable_raw_mode()?;
     crossterm::execute!(
         std::io::stdout(),
         crossterm::terminal::LeaveAlternateScreen,
-        crossterm::event::DisableMouseCapture,
     )?;
 
     Ok(())

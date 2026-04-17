@@ -1,4 +1,4 @@
-use crossterm::event::{self, KeyCode, KeyModifiers, MouseEventKind};
+use crossterm::event::{self, KeyCode, KeyModifiers};
 use hank_core::permission::PermissionResponse;
 use hank_core::query::{EngineCommand, QueryEvent, SpinnerMode};
 use ratatui::prelude::*;
@@ -164,19 +164,23 @@ impl<'a> App<'a> {
                     self.running = false;
                 }
             }
+            // Scroll: Up/Down arrows (from alternate scroll mode) and PageUp/PageDown
+            KeyCode::Up => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                self.auto_scroll = false;
+            }
+            KeyCode::Down => {
+                let max_scroll = self.max_scroll_offset();
+                self.scroll_offset = self.scroll_offset.saturating_add(3).min(max_scroll);
+                self.auto_scroll = self.scroll_offset >= max_scroll;
+            }
             KeyCode::PageUp => {
-                let new_offset = self.scroll_offset.saturating_sub(10);
-                if new_offset != self.scroll_offset {
-                    self.scroll_offset = new_offset;
-                }
+                self.scroll_offset = self.scroll_offset.saturating_sub(10);
                 self.auto_scroll = false;
             }
             KeyCode::PageDown => {
                 let max_scroll = self.max_scroll_offset();
-                let new_offset = self.scroll_offset.saturating_add(10).min(max_scroll);
-                if new_offset != self.scroll_offset {
-                    self.scroll_offset = new_offset;
-                }
+                self.scroll_offset = self.scroll_offset.saturating_add(10).min(max_scroll);
                 self.auto_scroll = self.scroll_offset >= max_scroll;
             }
             _ => {
@@ -239,27 +243,6 @@ impl<'a> App<'a> {
                 self.messages_text.push_str(&format!("\n[error: {msg}]\n"));
                 self.is_streaming = false;
             }
-        }
-    }
-
-    pub fn handle_mouse(&mut self, mouse: event::MouseEvent) {
-        match mouse.kind {
-            MouseEventKind::ScrollUp => {
-                let new_offset = self.scroll_offset.saturating_sub(3);
-                if new_offset != self.scroll_offset {
-                    self.scroll_offset = new_offset;
-                }
-                self.auto_scroll = false;
-            }
-            MouseEventKind::ScrollDown => {
-                let max_scroll = self.max_scroll_offset();
-                let new_offset = self.scroll_offset.saturating_add(3).min(max_scroll);
-                if new_offset != self.scroll_offset {
-                    self.scroll_offset = new_offset;
-                }
-                self.auto_scroll = self.scroll_offset >= max_scroll;
-            }
-            _ => {}
         }
     }
 
